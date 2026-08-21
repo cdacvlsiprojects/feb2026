@@ -1,0 +1,24 @@
+# QuestaSim / ModelSim generated files
+*.qdb
+*.qpg
+*.qtl
+*.wlf
+*.ucdb
+*.vcd
+transcript
+_info
+_vmake
+
+# Questa/ModelSim work libraries
+work/
+*_work/
+
+# Temporary Microsoft Office files
+~$*
+
+# General editor / OS temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
