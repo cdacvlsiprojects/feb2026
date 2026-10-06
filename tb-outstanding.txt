@@ -1,0 +1,617 @@
+`timescale 1ns/1ps
+// ============================================================
+// SIMPLE TB: AXI-Lite Crossbar 2x2 outstanding + same-slave contention
+//
+// Goal (visible via interfaces + terminal prints):
+// - Slave0 accepts many AW/W quickly (supports outstanding writes)
+// - Slave0 delays B responses until OUTSTANDING_LIMIT pending writes collected
+// - While M0 is building outstanding to Slave0, M1 also attempts writes to SAME Slave0
+//   (Crossbar may buffer/accept at master side; what matters is what reaches Slave0)
+// - We print Slave0 WDATA so you can see whether BBBB from M1 reaches Slave0 early.
+//
+// Notes:
+// - No implied relation between channels: AW and W are driven independently.
+// - Slave model uses SystemVerilog queues (TB-only) to robustly support outstanding.
+// ============================================================
+
+
+// ============================================================
+// AXI-Lite outstanding-write slave (TB model, uses queues)
+// - AW and W captured independently into queues
+// - When both queues non-empty, pop one of each -> one write completed -> pending_b++
+// - Hold B until pending_b >= OUTSTANDING_LIMIT, then drain all pending_b
+// ============================================================
+module axil_outstanding_write_slave #(
+  parameter int AW = 32,
+  parameter int DW = 32,
+  parameter int MEM_BYTES = 64*1024,
+
+  parameter int FIFO_DEPTH = 16,
+  parameter int OUTSTANDING_LIMIT = 8,
+  parameter int RESP_GAP = 3,
+  parameter int IDLE_DRAIN_CYCLES = 20
+)(
+  input  logic            ACLK,
+  input  logic            ARESETN,
+
+  input  logic            S_AWVALID,
+  output logic            S_AWREADY,
+  input  logic [AW-1:0]   S_AWADDR,
+  input  logic [2:0]      S_AWPROT,
+
+  input  logic            S_WVALID,
+  output logic            S_WREADY,
+  input  logic [DW-1:0]   S_WDATA,
+  input  logic [DW/8-1:0] S_WSTRB,
+
+  output logic            S_BVALID,
+  input  logic            S_BREADY,
+  output logic [1:0]      S_BRESP,
+
+  input  logic            S_ARVALID,
+  output logic            S_ARREADY,
+  input  logic [AW-1:0]   S_ARADDR,
+  input  logic [2:0]      S_ARPROT,
+
+  output logic            S_RVALID,
+  input  logic            S_RREADY,
+  output logic [DW-1:0]   S_RDATA,
+  output logic [1:0]      S_RRESP
+);
+  localparam int WORDS = MEM_BYTES/4;
+  logic [31:0] mem [0:WORDS-1];
+
+  // Queues (TB-only)
+  logic [AW-1:0]   aw_q[$];
+  logic [DW-1:0]   wdata_q[$];
+  logic [DW/8-1:0] wstrb_q[$];
+
+  int pending_b;
+  int resp_gap_cnt;
+  bit drain_mode;
+  int idle_cnt;
+
+  assign S_BRESP = 2'b00;
+  assign S_RRESP = 2'b00;
+
+  // Read channel (not used)
+  always_comb begin
+    S_ARREADY = ARESETN && !S_RVALID;
+  end
+
+  always_ff @(posedge ACLK) begin
+    if (!ARESETN) begin
+      S_RVALID <= 1'b0;
+      S_RDATA  <= '0;
+    end else begin
+      if (S_ARVALID && S_ARREADY) begin
+        S_RDATA  <= 32'hCAFE_0000 | (S_ARADDR[15:2] & 14'h3FFF);
+        S_RVALID <= 1'b1;
+      end
+      if (S_RVALID && S_RREADY)
+        S_RVALID <= 1'b0;
+    end
+  end
+
+  // Ready depends only on queue depth
+  always_comb begin
+    S_AWREADY = ARESETN && (aw_q.size() < FIFO_DEPTH);
+    S_WREADY  = ARESETN && (wdata_q.size() < FIFO_DEPTH);
+  end
+
+  always_ff @(posedge ACLK) begin
+    if (!ARESETN) begin
+      aw_q.delete();
+      wdata_q.delete();
+      wstrb_q.delete();
+
+      pending_b    <= 0;
+      resp_gap_cnt <= 0;
+      drain_mode   <= 1'b0;
+      idle_cnt    <= 0;
+      S_BVALID     <= 1'b0;
+
+      for (int i=0; i<WORDS; i++) mem[i] <= 32'h0;
+    end else begin
+      bit did_activity;
+      did_activity = 1'b0;
+      // Capture AW independently
+      if (S_AWVALID && S_AWREADY) begin
+        aw_q.push_back(S_AWADDR);
+        did_activity = 1'b1;
+      end
+
+      // Capture W independently
+      if (S_WVALID && S_WREADY) begin
+        wdata_q.push_back(S_WDATA);
+        wstrb_q.push_back(S_WSTRB);
+        did_activity = 1'b1;
+      end
+
+      // Pair one AW+W per cycle if available
+      if ((aw_q.size() > 0) && (wdata_q.size() > 0)) begin
+        logic [AW-1:0] addr;
+        logic [DW-1:0] wdat;
+        logic [DW/8-1:0] wstb;
+        int word_index;
+        logic [31:0] cur;
+
+        addr = aw_q.pop_front();
+        wdat = wdata_q.pop_front();
+        wstb = wstrb_q.pop_front();
+
+        word_index = addr[15:2];
+
+        if (word_index < WORDS) begin
+          cur = mem[word_index];
+          if (wstb[0]) cur[ 7: 0] = wdat[ 7: 0];
+          if (wstb[1]) cur[15: 8] = wdat[15: 8];
+          if (wstb[2]) cur[23:16] = wdat[23:16];
+          if (wstb[3]) cur[31:24] = wdat[31:24];
+          mem[word_index] <= cur;
+        end
+
+        pending_b <= pending_b + 1;
+        did_activity = 1'b1;
+      end
+
+      // Idle counter: if no activity for a while, start draining any remaining pending_b
+      if (did_activity)
+        idle_cnt <= 0;
+      else if (idle_cnt < IDLE_DRAIN_CYCLES)
+        idle_cnt <= idle_cnt + 1;
+
+      // Drain mode policy
+      if (pending_b >= OUTSTANDING_LIMIT)
+        drain_mode <= 1'b1;
+      else if ((pending_b > 0) && (idle_cnt >= IDLE_DRAIN_CYCLES))
+        drain_mode <= 1'b1;
+
+      if (pending_b == 0)
+        drain_mode <= 1'b0;
+
+      // B channel
+      if (S_BVALID) begin
+        if (S_BREADY) begin
+          did_activity = 1'b1;
+          S_BVALID <= 1'b0;
+          if (pending_b > 0)
+            pending_b <= pending_b - 1;
+          resp_gap_cnt <= RESP_GAP;
+        end
+      end else begin
+        if (resp_gap_cnt > 0) begin
+          resp_gap_cnt <= resp_gap_cnt - 1;
+        end else begin
+          if (drain_mode && (pending_b > 0))
+            S_BVALID <= 1'b1;
+        end
+      end
+    end
+  end
+
+endmodule
+
+
+// ============================================================
+// TESTBENCH TOP
+// ============================================================
+module tb_axilxbar_outstanding_2x2_simple;
+
+  localparam int AW = 32;
+  localparam int DW = 32;
+  localparam int NM = 2;
+  localparam int NS = 2;
+
+  localparam int TIMEOUT_CYCLES = 20000;
+
+  logic clk, rstn;
+
+  // Masters (S_AXI_*)
+  logic [NM-1:0]        S_AXI_AWVALID;
+  wire  [NM-1:0]        S_AXI_AWREADY;
+  logic [NM*AW-1:0]     S_AXI_AWADDR;
+  logic [NM*3-1:0]      S_AXI_AWPROT;
+
+  logic [NM-1:0]        S_AXI_WVALID;
+  wire  [NM-1:0]        S_AXI_WREADY;
+  logic [NM*DW-1:0]     S_AXI_WDATA;
+  logic [NM*(DW/8)-1:0] S_AXI_WSTRB;
+
+  wire  [NM-1:0]        S_AXI_BVALID;
+  logic [NM-1:0]        S_AXI_BREADY;
+  wire  [NM*2-1:0]      S_AXI_BRESP;
+
+  logic [NM-1:0]        S_AXI_ARVALID;
+  wire  [NM-1:0]        S_AXI_ARREADY;
+  logic [NM*AW-1:0]     S_AXI_ARADDR;
+  logic [NM*3-1:0]      S_AXI_ARPROT;
+
+  wire  [NM-1:0]        S_AXI_RVALID;
+  logic [NM-1:0]        S_AXI_RREADY;
+  wire  [NM*DW-1:0]     S_AXI_RDATA;
+  wire  [NM*2-1:0]      S_AXI_RRESP;
+
+  // Slaves (M_AXI_*)
+  wire  [NS*AW-1:0]     M_AXI_AWADDR;
+  wire  [NS*3-1:0]      M_AXI_AWPROT;
+  wire  [NS-1:0]        M_AXI_AWVALID;
+  wire  [NS-1:0]        M_AXI_AWREADY;
+
+  wire  [NS*DW-1:0]     M_AXI_WDATA;
+  wire  [NS*(DW/8)-1:0] M_AXI_WSTRB;
+  wire  [NS-1:0]        M_AXI_WVALID;
+  wire  [NS-1:0]        M_AXI_WREADY;
+
+  wire  [NS*2-1:0]      M_AXI_BRESP;
+  wire  [NS-1:0]        M_AXI_BVALID;
+  wire  [NS-1:0]        M_AXI_BREADY;
+
+  wire  [NS*AW-1:0]     M_AXI_ARADDR;
+  wire  [NS*3-1:0]      M_AXI_ARPROT;
+  wire  [NS-1:0]        M_AXI_ARVALID;
+  wire  [NS-1:0]        M_AXI_ARREADY;
+
+  wire  [NS*DW-1:0]     M_AXI_RDATA;
+  wire  [NS*2-1:0]      M_AXI_RRESP;
+  wire  [NS-1:0]        M_AXI_RVALID;
+  wire  [NS-1:0]        M_AXI_RREADY;
+
+  // Address map: two 64KB slaves
+  localparam logic [NS*AW-1:0] SLAVE_ADDR = {32'h0001_0000, 32'h0000_0000};
+  localparam logic [NS*AW-1:0] SLAVE_MASK = {32'hFFFF_0000, 32'hFFFF_0000};
+
+  // ============================================================
+  // Aliases for waveform readability
+  // ============================================================
+  // Master 0
+  wire         m0_awvalid = S_AXI_AWVALID[0];
+  wire         m0_awready = S_AXI_AWREADY[0];
+  wire [AW-1:0] m0_awaddr  = S_AXI_AWADDR[0*AW +: AW];
+  wire         m0_wvalid  = S_AXI_WVALID[0];
+  wire         m0_wready  = S_AXI_WREADY[0];
+  wire [DW-1:0] m0_wdata   = S_AXI_WDATA[0*DW +: DW];
+  wire         m0_bvalid  = S_AXI_BVALID[0];
+  wire         m0_bready  = S_AXI_BREADY[0];
+
+  // Master 1
+  wire         m1_awvalid = S_AXI_AWVALID[1];
+  wire         m1_awready = S_AXI_AWREADY[1];
+  wire [AW-1:0] m1_awaddr  = S_AXI_AWADDR[1*AW +: AW];
+  wire         m1_wvalid  = S_AXI_WVALID[1];
+  wire         m1_wready  = S_AXI_WREADY[1];
+  wire [DW-1:0] m1_wdata   = S_AXI_WDATA[1*DW +: DW];
+  wire         m1_bvalid  = S_AXI_BVALID[1];
+  wire         m1_bready  = S_AXI_BREADY[1];
+
+  // Slave0
+  wire         s0_awvalid = M_AXI_AWVALID[0];
+  wire         s0_awready = M_AXI_AWREADY[0];
+  wire [AW-1:0] s0_awaddr  = M_AXI_AWADDR[0*AW +: AW];
+  wire         s0_wvalid  = M_AXI_WVALID[0];
+  wire         s0_wready  = M_AXI_WREADY[0];
+  wire [DW-1:0] s0_wdata   = M_AXI_WDATA[0*DW +: DW];
+  wire         s0_bvalid  = M_AXI_BVALID[0];
+  wire         s0_bready  = M_AXI_BREADY[0];
+
+  // ============================================================
+  // DUT
+  // ============================================================
+  axilxbar #(
+    .C_AXI_DATA_WIDTH(DW),
+    .C_AXI_ADDR_WIDTH(AW),
+    .NM(NM),
+    .NS(NS),
+    .SLAVE_ADDR(SLAVE_ADDR),
+    .SLAVE_MASK(SLAVE_MASK)
+  ) dut (
+    .S_AXI_ACLK   (clk),
+    .S_AXI_ARESETN(rstn),
+
+    .S_AXI_AWVALID(S_AXI_AWVALID),
+    .S_AXI_AWREADY(S_AXI_AWREADY),
+    .S_AXI_AWADDR (S_AXI_AWADDR),
+    .S_AXI_AWPROT (S_AXI_AWPROT),
+
+    .S_AXI_WVALID (S_AXI_WVALID),
+    .S_AXI_WREADY (S_AXI_WREADY),
+    .S_AXI_WDATA  (S_AXI_WDATA),
+    .S_AXI_WSTRB  (S_AXI_WSTRB),
+
+    .S_AXI_BVALID (S_AXI_BVALID),
+    .S_AXI_BREADY (S_AXI_BREADY),
+    .S_AXI_BRESP  (S_AXI_BRESP),
+
+    .S_AXI_ARVALID(S_AXI_ARVALID),
+    .S_AXI_ARREADY(S_AXI_ARREADY),
+    .S_AXI_ARADDR (S_AXI_ARADDR),
+    .S_AXI_ARPROT (S_AXI_ARPROT),
+
+    .S_AXI_RVALID (S_AXI_RVALID),
+    .S_AXI_RREADY (S_AXI_RREADY),
+    .S_AXI_RDATA  (S_AXI_RDATA),
+    .S_AXI_RRESP  (S_AXI_RRESP),
+
+    .M_AXI_AWADDR (M_AXI_AWADDR),
+    .M_AXI_AWPROT (M_AXI_AWPROT),
+    .M_AXI_AWVALID(M_AXI_AWVALID),
+    .M_AXI_AWREADY(M_AXI_AWREADY),
+
+    .M_AXI_WDATA  (M_AXI_WDATA),
+    .M_AXI_WSTRB  (M_AXI_WSTRB),
+    .M_AXI_WVALID (M_AXI_WVALID),
+    .M_AXI_WREADY (M_AXI_WREADY),
+
+    .M_AXI_BRESP  (M_AXI_BRESP),
+    .M_AXI_BVALID (M_AXI_BVALID),
+    .M_AXI_BREADY (M_AXI_BREADY),
+
+    .M_AXI_ARADDR (M_AXI_ARADDR),
+    .M_AXI_ARPROT (M_AXI_ARPROT),
+    .M_AXI_ARVALID(M_AXI_ARVALID),
+    .M_AXI_ARREADY(M_AXI_ARREADY),
+
+    .M_AXI_RDATA  (M_AXI_RDATA),
+    .M_AXI_RRESP  (M_AXI_RRESP),
+    .M_AXI_RVALID (M_AXI_RVALID),
+    .M_AXI_RREADY (M_AXI_RREADY)
+  );
+
+  // Slaves
+  axil_outstanding_write_slave #(
+    .AW(AW), .DW(DW),
+    .MEM_BYTES(64*1024),
+    .FIFO_DEPTH(16),
+    .OUTSTANDING_LIMIT(8),
+    .RESP_GAP(3)
+  ) s0 (
+    .ACLK(clk), .ARESETN(rstn),
+
+    .S_AWVALID(M_AXI_AWVALID[0]),
+    .S_AWREADY(M_AXI_AWREADY[0]),
+    .S_AWADDR (M_AXI_AWADDR[0*AW +: AW]),
+    .S_AWPROT (M_AXI_AWPROT[0*3  +: 3]),
+
+    .S_WVALID (M_AXI_WVALID[0]),
+    .S_WREADY (M_AXI_WREADY[0]),
+    .S_WDATA  (M_AXI_WDATA[0*DW +: DW]),
+    .S_WSTRB  (M_AXI_WSTRB[0*(DW/8) +: (DW/8)]),
+
+    .S_BVALID (M_AXI_BVALID[0]),
+    .S_BREADY (M_AXI_BREADY[0]),
+    .S_BRESP  (M_AXI_BRESP[0*2 +: 2]),
+
+    .S_ARVALID(M_AXI_ARVALID[0]),
+    .S_ARREADY(M_AXI_ARREADY[0]),
+    .S_ARADDR (M_AXI_ARADDR[0*AW +: AW]),
+    .S_ARPROT (M_AXI_ARPROT[0*3  +: 3]),
+
+    .S_RVALID (M_AXI_RVALID[0]),
+    .S_RREADY (M_AXI_RREADY[0]),
+    .S_RDATA  (M_AXI_RDATA[0*DW +: DW]),
+    .S_RRESP  (M_AXI_RRESP[0*2 +: 2])
+  );
+
+  axil_outstanding_write_slave #(
+    .AW(AW), .DW(DW),
+    .MEM_BYTES(64*1024),
+    .FIFO_DEPTH(8),
+    .OUTSTANDING_LIMIT(1),
+    .RESP_GAP(1)
+  ) s1 (
+    .ACLK(clk), .ARESETN(rstn),
+
+    .S_AWVALID(M_AXI_AWVALID[1]),
+    .S_AWREADY(M_AXI_AWREADY[1]),
+    .S_AWADDR (M_AXI_AWADDR[1*AW +: AW]),
+    .S_AWPROT (M_AXI_AWPROT[1*3  +: 3]),
+
+    .S_WVALID (M_AXI_WVALID[1]),
+    .S_WREADY (M_AXI_WREADY[1]),
+    .S_WDATA  (M_AXI_WDATA[1*DW +: DW]),
+    .S_WSTRB  (M_AXI_WSTRB[1*(DW/8) +: (DW/8)]),
+
+    .S_BVALID (M_AXI_BVALID[1]),
+    .S_BREADY (M_AXI_BREADY[1]),
+    .S_BRESP  (M_AXI_BRESP[1*2 +: 2]),
+
+    .S_ARVALID(M_AXI_ARVALID[1]),
+    .S_ARREADY(M_AXI_ARREADY[1]),
+    .S_ARADDR (M_AXI_ARADDR[1*AW +: AW]),
+    .S_ARPROT (M_AXI_ARPROT[1*3  +: 3]),
+
+    .S_RVALID (M_AXI_RVALID[1]),
+    .S_RREADY (M_AXI_RREADY[1]),
+    .S_RDATA  (M_AXI_RDATA[1*DW +: DW]),
+    .S_RRESP  (M_AXI_RRESP[1*2 +: 2])
+  );
+
+  // Clock / Reset
+  initial clk = 1'b0;
+  always #5 clk = ~clk;
+
+  initial begin
+    rstn = 1'b0;
+
+    S_AXI_AWVALID = '0;
+    S_AXI_AWADDR  = '0;
+    S_AXI_AWPROT  = '0;
+
+    S_AXI_WVALID  = '0;
+    S_AXI_WDATA   = '0;
+    S_AXI_WSTRB   = '0;
+
+    S_AXI_BREADY  = '0;
+
+    S_AXI_ARVALID = '0;
+    S_AXI_ARADDR  = '0;
+    S_AXI_ARPROT  = '0;
+
+    S_AXI_RREADY  = '0;
+
+    $display("============================================================");
+    $display("SCENARIO START");
+    $display("M0: 10 writes -> Slave0 (slow B, outstanding threshold=8)");
+    $display("M1:  2 writes -> SAME Slave0 while M0 outstanding");
+    $display("EXPECT: Observe whether BBBB data reaches Slave0 before M0 B drains");
+    $display("============================================================");
+
+    repeat (10) @(posedge clk);
+    rstn = 1'b1;
+    $display("[%0t] Reset deasserted", $time);
+  end
+
+  // Safety timeout
+  initial begin
+    #20ms;
+    $error("[%0t] TB TIMEOUT", $time);
+    $finish;
+  end
+
+  // ============================================================
+  // Monitor: print interface handshakes + Slave0 data
+  // ============================================================
+  always_ff @(posedge clk) begin
+    if (rstn) begin
+      if (m0_awvalid && m0_awready) $display("[%0t] M0 AW handshake  addr=%h", $time, m0_awaddr);
+      if (m0_wvalid  && m0_wready ) $display("[%0t] M0  W handshake  data=%h", $time, m0_wdata);
+      if (m0_bvalid  && m0_bready ) $display("[%0t] M0  B handshake  resp=%b", $time, S_AXI_BRESP[0*2 +: 2]);
+
+      if (m1_awvalid && m1_awready) $display("[%0t] M1 AW handshake  addr=%h", $time, m1_awaddr);
+      if (m1_wvalid  && m1_wready ) $display("[%0t] M1  W handshake  data=%h", $time, m1_wdata);
+      if (m1_bvalid  && m1_bready ) $display("[%0t] M1  B handshake  resp=%b", $time, S_AXI_BRESP[1*2 +: 2]);
+
+      if (s0_awvalid && s0_awready) $display("[%0t] S0 AW accept     addr=%h", $time, s0_awaddr);
+      if (s0_wvalid  && s0_wready ) $display("[%0t] S0  W accept     data=%h", $time, s0_wdata);
+
+      if (s0_bvalid && !s0_bready)  $display("[%0t] S0 BVALID=1 but BREADY=0 (xbar backpressure)", $time);
+      if (s0_bvalid &&  s0_bready)  $display("[%0t] S0  B handshake   pending_b(after)=%0d", $time, s0.pending_b-1);
+    end
+  end
+
+  // ============================================================
+  // Master drivers (AW and W independent)
+  // ============================================================
+  task automatic drive_aw(input int m, input logic [AW-1:0] addr);
+    int tmo;
+    begin
+      S_AXI_AWADDR[m*AW +: AW] = addr;
+      S_AXI_AWPROT[m*3  +: 3 ] = 3'b000;
+      S_AXI_AWVALID[m] = 1'b1;
+
+      tmo = 0;
+      while (!(S_AXI_AWVALID[m] && S_AXI_AWREADY[m])) begin
+        @(posedge clk);
+        if (!rstn) continue;
+        if (++tmo > TIMEOUT_CYCLES) begin
+          $error("[%0t] TIMEOUT: M%0d AW not accepted addr=%h", $time, m, addr);
+          $finish;
+        end
+      end
+      @(posedge clk);
+      S_AXI_AWVALID[m] = 1'b0;
+    end
+  endtask
+
+  task automatic drive_w(input int m, input logic [DW-1:0] data, input logic [DW/8-1:0] strb);
+    int tmo;
+    begin
+      S_AXI_WDATA[m*DW +: DW] = data;
+      S_AXI_WSTRB[m*(DW/8) +: (DW/8)] = strb;
+      S_AXI_WVALID[m] = 1'b1;
+
+      tmo = 0;
+      while (!(S_AXI_WVALID[m] && S_AXI_WREADY[m])) begin
+        @(posedge clk);
+        if (!rstn) continue;
+        if (++tmo > TIMEOUT_CYCLES) begin
+          $error("[%0t] TIMEOUT: M%0d W not accepted data=%h", $time, m, data);
+          $finish;
+        end
+      end
+      @(posedge clk);
+      S_AXI_WVALID[m] = 1'b0;
+    end
+  endtask
+
+  // BREADY always high
+  initial begin
+    wait(rstn === 1'b1);
+    S_AXI_BREADY[0] = 1'b1;
+    S_AXI_BREADY[1] = 1'b1;
+  end
+
+  task automatic rand_gap();
+    int k;
+    begin
+      k = $urandom_range(0,3);
+      repeat (k) @(posedge clk);
+    end
+  endtask
+
+  // Count B handshakes per master
+  int m0_w_accepted, m0_b_recv;
+  int m1_w_accepted, m1_b_recv;
+
+  always_ff @(posedge clk) begin
+    if (!rstn) begin
+      m0_b_recv <= 0;
+      m1_b_recv <= 0;
+    end else begin
+      if (S_AXI_BVALID[0] && S_AXI_BREADY[0]) m0_b_recv <= m0_b_recv + 1;
+      if (S_AXI_BVALID[1] && S_AXI_BREADY[1]) m1_b_recv <= m1_b_recv + 1;
+    end
+  end
+
+  initial begin : RUN
+    m0_w_accepted = 0;
+    m1_w_accepted = 0;
+
+    wait(rstn === 1'b1);
+    repeat (5) @(posedge clk);
+
+    $display("[%0t] M0 starting 10 writes to Slave0 ...", $time);
+    fork
+      begin : M0_AW
+        for (int i=0; i<10; i++) begin
+          rand_gap();
+          drive_aw(0, 32'h0000_0000 + (i*4));
+        end
+      end
+      begin : M0_W
+        for (int i=0; i<10; i++) begin
+          rand_gap();
+          drive_w(0, 32'hAAAA_0000 + i, 4'hF);
+          m0_w_accepted++;
+        end
+      end
+    join
+
+    $display("[%0t] M0 finished issuing (W accepted=%0d). M1 will now try same slave ...", $time, m0_w_accepted);
+
+    $display("[%0t] M1 attempting 2 writes to SAME Slave0 ...", $time);
+// For reliability with many AXI-Lite crossbars, drive AW then W (no channel implication inside the crossbar)
+drive_aw(1, 32'h0000_0100);
+drive_w (1, 32'hBBBB_0001, 4'hF);  m1_w_accepted++;
+drive_aw(1, 32'h0000_0104);
+drive_w (1, 32'hBBBB_0002, 4'hF);  m1_w_accepted++;
+
+
+    $display("[%0t] Waiting: M0 B responses (%0d expected) ...", $time, m0_w_accepted);
+    while (m0_b_recv < m0_w_accepted) @(posedge clk);
+    $display("[%0t] M0 complete: B received=%0d", $time, m0_b_recv);
+
+    $display("[%0t] Waiting: M1 B responses (%0d expected) ...", $time, m1_w_accepted);
+    while (m1_b_recv < m1_w_accepted) @(posedge clk);
+    $display("[%0t] M1 complete: B received=%0d", $time, m1_b_recv);
+
+    $display("============================================================");
+    $display("TEST DONE");
+    $display("Check prints: if S0 W accept shows BBBB early, then M1 reached Slave0 early.");
+    $display("============================================================");
+
+    repeat (20) @(posedge clk);
+    $finish;
+  end
+
+endmodule

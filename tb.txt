@@ -1,0 +1,750 @@
+`timescale 1ns/1ps
+
+// ------------------------------------------------------------
+// Simple AXI-Lite memory slave (SV)
+// - 32-bit data, 64KB default
+// - 1 outstanding read + 1 outstanding write response
+// - fixed response latency (RESP_LATENCY cycles)
+// ------------------------------------------------------------
+module axil_mem_slave_sv #(
+  parameter int AW = 32,
+  parameter int DW = 32,
+  parameter int MEM_BYTES = 64*1024,
+  parameter int RESP_LATENCY = 2
+)(
+  input  logic            ACLK,
+  input  logic            ARESETN,
+
+  input  logic            S_AWVALID,
+  output logic            S_AWREADY,
+  input  logic [AW-1:0]   S_AWADDR,
+  input  logic [2:0]      S_AWPROT,
+
+  input  logic            S_WVALID,
+  output logic            S_WREADY,
+  input  logic [DW-1:0]   S_WDATA,
+  input  logic [DW/8-1:0] S_WSTRB,
+
+  output logic            S_BVALID,
+  input  logic            S_BREADY,
+  output logic [1:0]      S_BRESP,
+
+  input  logic            S_ARVALID,
+  output logic            S_ARREADY,
+  input  logic [AW-1:0]   S_ARADDR,
+  input  logic [2:0]      S_ARPROT,
+
+  output logic            S_RVALID,
+  input  logic            S_RREADY,
+  output logic [DW-1:0]   S_RDATA,
+  output logic [1:0]      S_RRESP
+);
+  localparam int WORDS = MEM_BYTES/4;
+  logic [31:0] mem [0:WORDS-1];
+
+  logic        have_aw, have_w, have_ar;
+  logic [AW-1:0] awaddr_q, araddr_q;
+  logic [DW-1:0] wdata_q;
+  logic [DW/8-1:0] wstrb_q;
+  int w_cnt, r_cnt;
+
+  // 64KB region => use [15:2] as word index for default mapping
+  wire [31:0] aw_word_index = awaddr_q[15:2];
+  wire [31:0] ar_word_index = araddr_q[15:2];
+
+  assign S_BRESP = 2'b00; // OKAY
+  assign S_RRESP = 2'b00; // OKAY
+
+  always_comb begin
+    S_AWREADY = ARESETN && !have_aw;
+    S_WREADY  = ARESETN && !have_w;
+    // keep one outstanding read at a time
+    S_ARREADY = ARESETN && !have_ar && !S_RVALID;
+  end
+
+  always_ff @(posedge ACLK) begin
+    if (!ARESETN) begin
+      have_aw <= 1'b0; have_w <= 1'b0; have_ar <= 1'b0;
+      awaddr_q <= '0; araddr_q <= '0;
+      wdata_q <= '0; wstrb_q <= '0;
+      S_BVALID <= 1'b0;
+      S_RVALID <= 1'b0;
+      S_RDATA  <= '0;
+      w_cnt <= 0; r_cnt <= 0;
+
+      for (int i=0; i<WORDS; i++) mem[i] <= 32'h0;
+    end else begin
+      // Latch AW
+      if (S_AWVALID && S_AWREADY) begin
+        have_aw  <= 1'b1;
+        awaddr_q <= S_AWADDR;
+      end
+
+      // Latch W
+      if (S_WVALID && S_WREADY) begin
+        have_w  <= 1'b1;
+        wdata_q <= S_WDATA;
+        wstrb_q <= S_WSTRB;
+      end
+
+      // When both captured, perform write then start B latency counter
+      if (have_aw && have_w && !S_BVALID && (w_cnt==0)) begin
+        if (aw_word_index < WORDS) begin
+          logic [31:0] cur;
+          cur = mem[aw_word_index];
+          if (wstrb_q[0]) cur[ 7: 0] = wdata_q[ 7: 0];
+          if (wstrb_q[1]) cur[15: 8] = wdata_q[15: 8];
+          if (wstrb_q[2]) cur[23:16] = wdata_q[23:16];
+          if (wstrb_q[3]) cur[31:24] = wdata_q[31:24];
+          mem[aw_word_index] <= cur;
+        end
+        w_cnt <= RESP_LATENCY;
+      end
+
+      if (w_cnt > 0) begin
+        w_cnt <= w_cnt - 1;
+        if (w_cnt == 1) S_BVALID <= 1'b1;
+      end
+
+      if (S_BVALID && S_BREADY) begin
+        S_BVALID <= 1'b0;
+        have_aw  <= 1'b0;
+        have_w   <= 1'b0;
+      end
+
+      // Latch AR
+      if (S_ARVALID && S_ARREADY) begin
+        have_ar  <= 1'b1;
+        araddr_q <= S_ARADDR;
+        r_cnt    <= RESP_LATENCY;
+      end
+
+      if (have_ar && (r_cnt > 0)) begin
+        r_cnt <= r_cnt - 1;
+        if (r_cnt == 1) begin
+          if (ar_word_index < WORDS) S_RDATA <= mem[ar_word_index];
+          else                       S_RDATA <= 32'hDEAD_BEEF;
+          S_RVALID <= 1'b1;
+        end
+      end
+
+      if (S_RVALID && S_RREADY) begin
+        S_RVALID <= 1'b0;
+        have_ar  <= 1'b0;
+      end
+    end
+  end
+endmodule
+
+
+// ------------------------------------------------------------
+// Testbench for axilxbar: 2 masters x 2 slaves
+// ------------------------------------------------------------
+module tb_axilxbar_2x2;
+
+  localparam int AW = 32;
+  localparam int DW = 32;
+  localparam int NM = 2;
+  localparam int NS = 2;
+
+  localparam int TIMEOUT_CYCLES = 5000;
+
+  logic clk, rstn;
+
+  // -------- Master side (S_AXI_*) packed buses ----------
+  logic [NM-1:0]        S_AXI_AWVALID;
+  wire  [NM-1:0]        S_AXI_AWREADY;
+  logic [NM*AW-1:0]     S_AXI_AWADDR;
+  logic [NM*3-1:0]      S_AXI_AWPROT;
+
+  logic [NM-1:0]        S_AXI_WVALID;
+  wire  [NM-1:0]        S_AXI_WREADY;
+  logic [NM*DW-1:0]     S_AXI_WDATA;
+  logic [NM*(DW/8)-1:0] S_AXI_WSTRB;
+
+  wire  [NM-1:0]        S_AXI_BVALID;
+  logic [NM-1:0]        S_AXI_BREADY;
+  wire  [NM*2-1:0]      S_AXI_BRESP;
+
+  logic [NM-1:0]        S_AXI_ARVALID;
+  wire  [NM-1:0]        S_AXI_ARREADY;
+  logic [NM*AW-1:0]     S_AXI_ARADDR;
+  logic [NM*3-1:0]      S_AXI_ARPROT;
+
+  wire  [NM-1:0]        S_AXI_RVALID;
+  logic [NM-1:0]        S_AXI_RREADY;
+  wire  [NM*DW-1:0]     S_AXI_RDATA;
+  wire  [NM*2-1:0]      S_AXI_RRESP;
+
+  // -------- Slave side (M_AXI_*) packed buses ----------
+  wire  [NS*AW-1:0]     M_AXI_AWADDR;
+  wire  [NS*3-1:0]      M_AXI_AWPROT;
+  wire  [NS-1:0]        M_AXI_AWVALID;
+  wire  [NS-1:0]        M_AXI_AWREADY;
+
+  wire  [NS*DW-1:0]     M_AXI_WDATA;
+  wire  [NS*(DW/8)-1:0] M_AXI_WSTRB;
+  wire  [NS-1:0]        M_AXI_WVALID;
+  wire  [NS-1:0]        M_AXI_WREADY;
+
+  wire  [NS*2-1:0]      M_AXI_BRESP;
+  wire  [NS-1:0]        M_AXI_BVALID;
+  wire  [NS-1:0]        M_AXI_BREADY;
+
+  wire  [NS*AW-1:0]     M_AXI_ARADDR;
+  wire  [NS*3-1:0]      M_AXI_ARPROT;
+  wire  [NS-1:0]        M_AXI_ARVALID;
+  wire  [NS-1:0]        M_AXI_ARREADY;
+
+  wire  [NS*DW-1:0]     M_AXI_RDATA;
+  wire  [NS*2-1:0]      M_AXI_RRESP;
+  wire  [NS-1:0]        M_AXI_RVALID;
+  wire  [NS-1:0]        M_AXI_RREADY;
+
+  // Address map: two 64KB slaves
+  localparam logic [NS*AW-1:0] SLAVE_ADDR = {32'h0001_0000, 32'h0000_0000};
+  localparam logic [NS*AW-1:0] SLAVE_MASK = {32'hFFFF_0000, 32'hFFFF_0000};
+
+  // ============================================================
+  // VIEW SIGNALS (for waveform): per-master and per-slave slices
+  // ============================================================
+
+  // Master 0
+  wire        m0_awvalid = S_AXI_AWVALID[0];
+  wire        m0_awready = S_AXI_AWREADY[0];
+  wire [AW-1:0] m0_awaddr  = S_AXI_AWADDR[0*AW +: AW];
+  wire [2:0]  m0_awprot  = S_AXI_AWPROT[0*3  +: 3];
+  wire        m0_wvalid  = S_AXI_WVALID[0];
+  wire        m0_wready  = S_AXI_WREADY[0];
+  wire [DW-1:0] m0_wdata   = S_AXI_WDATA[0*DW +: DW];
+  wire [DW/8-1:0] m0_wstrb = S_AXI_WSTRB[0*(DW/8) +: (DW/8)];
+  wire        m0_bvalid  = S_AXI_BVALID[0];
+  wire        m0_bready  = S_AXI_BREADY[0];
+  wire [1:0]  m0_bresp   = S_AXI_BRESP[0*2 +: 2];
+  wire        m0_arvalid = S_AXI_ARVALID[0];
+  wire        m0_arready = S_AXI_ARREADY[0];
+  wire [AW-1:0] m0_araddr  = S_AXI_ARADDR[0*AW +: AW];
+  wire [2:0]  m0_arprot  = S_AXI_ARPROT[0*3  +: 3];
+  wire        m0_rvalid  = S_AXI_RVALID[0];
+  wire        m0_rready  = S_AXI_RREADY[0];
+  wire [DW-1:0] m0_rdata   = S_AXI_RDATA[0*DW +: DW];
+  wire [1:0]  m0_rresp   = S_AXI_RRESP[0*2 +: 2];
+
+  // Master 1
+  wire        m1_awvalid = S_AXI_AWVALID[1];
+  wire        m1_awready = S_AXI_AWREADY[1];
+  wire [AW-1:0] m1_awaddr  = S_AXI_AWADDR[1*AW +: AW];
+  wire [2:0]  m1_awprot  = S_AXI_AWPROT[1*3  +: 3];
+  wire        m1_wvalid  = S_AXI_WVALID[1];
+  wire        m1_wready  = S_AXI_WREADY[1];
+  wire [DW-1:0] m1_wdata   = S_AXI_WDATA[1*DW +: DW];
+  wire [DW/8-1:0] m1_wstrb = S_AXI_WSTRB[1*(DW/8) +: (DW/8)];
+  wire        m1_bvalid  = S_AXI_BVALID[1];
+  wire        m1_bready  = S_AXI_BREADY[1];
+  wire [1:0]  m1_bresp   = S_AXI_BRESP[1*2 +: 2];
+  wire        m1_arvalid = S_AXI_ARVALID[1];
+  wire        m1_arready = S_AXI_ARREADY[1];
+  wire [AW-1:0] m1_araddr  = S_AXI_ARADDR[1*AW +: AW];
+  wire [2:0]  m1_arprot  = S_AXI_ARPROT[1*3  +: 3];
+  wire        m1_rvalid  = S_AXI_RVALID[1];
+  wire        m1_rready  = S_AXI_RREADY[1];
+  wire [DW-1:0] m1_rdata   = S_AXI_RDATA[1*DW +: DW];
+  wire [1:0]  m1_rresp   = S_AXI_RRESP[1*2 +: 2];
+
+  // Slave 0 (M_AXI toward slave0)
+  wire        s0_awvalid = M_AXI_AWVALID[0];
+  wire        s0_awready = M_AXI_AWREADY[0];
+  wire [AW-1:0] s0_awaddr  = M_AXI_AWADDR[0*AW +: AW];
+  wire [2:0]  s0_awprot  = M_AXI_AWPROT[0*3  +: 3];
+  wire        s0_wvalid  = M_AXI_WVALID[0];
+  wire        s0_wready  = M_AXI_WREADY[0];
+  wire [DW-1:0] s0_wdata   = M_AXI_WDATA[0*DW +: DW];
+  wire [DW/8-1:0] s0_wstrb = M_AXI_WSTRB[0*(DW/8) +: (DW/8)];
+  wire        s0_bvalid  = M_AXI_BVALID[0];
+  wire        s0_bready  = M_AXI_BREADY[0];
+  wire [1:0]  s0_bresp   = M_AXI_BRESP[0*2 +: 2];
+  wire        s0_arvalid = M_AXI_ARVALID[0];
+  wire        s0_arready = M_AXI_ARREADY[0];
+  wire [AW-1:0] s0_araddr  = M_AXI_ARADDR[0*AW +: AW];
+  wire [2:0]  s0_arprot  = M_AXI_ARPROT[0*3  +: 3];
+  wire        s0_rvalid  = M_AXI_RVALID[0];
+  wire        s0_rready  = M_AXI_RREADY[0];
+  wire [DW-1:0] s0_rdata   = M_AXI_RDATA[0*DW +: DW];
+  wire [1:0]  s0_rresp   = M_AXI_RRESP[0*2 +: 2];
+
+  // Slave 1 (M_AXI toward slave1)
+  wire        s1_awvalid = M_AXI_AWVALID[1];
+  wire        s1_awready = M_AXI_AWREADY[1];
+  wire [AW-1:0] s1_awaddr  = M_AXI_AWADDR[1*AW +: AW];
+  wire [2:0]  s1_awprot  = M_AXI_AWPROT[1*3  +: 3];
+  wire        s1_wvalid  = M_AXI_WVALID[1];
+  wire        s1_wready  = M_AXI_WREADY[1];
+  wire [DW-1:0] s1_wdata   = M_AXI_WDATA[1*DW +: DW];
+  wire [DW/8-1:0] s1_wstrb = M_AXI_WSTRB[1*(DW/8) +: (DW/8)];
+  wire        s1_bvalid  = M_AXI_BVALID[1];
+  wire        s1_bready  = M_AXI_BREADY[1];
+  wire [1:0]  s1_bresp   = M_AXI_BRESP[1*2 +: 2];
+  wire        s1_arvalid = M_AXI_ARVALID[1];
+  wire        s1_arready = M_AXI_ARREADY[1];
+  wire [AW-1:0] s1_araddr  = M_AXI_ARADDR[1*AW +: AW];
+  wire [2:0]  s1_arprot  = M_AXI_ARPROT[1*3  +: 3];
+  wire        s1_rvalid  = M_AXI_RVALID[1];
+  wire        s1_rready  = M_AXI_RREADY[1];
+  wire [DW-1:0] s1_rdata   = M_AXI_RDATA[1*DW +: DW];
+  wire [1:0]  s1_rresp   = M_AXI_RRESP[1*2 +: 2];
+
+  // ---------------- DUT ----------------
+  // NOTE: these parameter names must match your design. If your DUT differs,
+  // change them accordingly.
+  axilxbar #(
+    .C_AXI_DATA_WIDTH(DW),
+    .C_AXI_ADDR_WIDTH(AW),
+    .NM(NM),
+    .NS(NS),
+    .SLAVE_ADDR(SLAVE_ADDR),
+    .SLAVE_MASK(SLAVE_MASK)
+  ) dut (
+    .S_AXI_ACLK   (clk),
+    .S_AXI_ARESETN(rstn),
+
+    .S_AXI_AWVALID(S_AXI_AWVALID),
+    .S_AXI_AWREADY(S_AXI_AWREADY),
+    .S_AXI_AWADDR (S_AXI_AWADDR),
+    .S_AXI_AWPROT (S_AXI_AWPROT),
+
+    .S_AXI_WVALID (S_AXI_WVALID),
+    .S_AXI_WREADY (S_AXI_WREADY),
+    .S_AXI_WDATA  (S_AXI_WDATA),
+    .S_AXI_WSTRB  (S_AXI_WSTRB),
+
+    .S_AXI_BVALID (S_AXI_BVALID),
+    .S_AXI_BREADY (S_AXI_BREADY),
+    .S_AXI_BRESP  (S_AXI_BRESP),
+
+    .S_AXI_ARVALID(S_AXI_ARVALID),
+    .S_AXI_ARREADY(S_AXI_ARREADY),
+    .S_AXI_ARADDR (S_AXI_ARADDR),
+    .S_AXI_ARPROT (S_AXI_ARPROT),
+
+    .S_AXI_RVALID (S_AXI_RVALID),
+    .S_AXI_RREADY (S_AXI_RREADY),
+    .S_AXI_RDATA  (S_AXI_RDATA),
+    .S_AXI_RRESP  (S_AXI_RRESP),
+
+    .M_AXI_AWADDR (M_AXI_AWADDR),
+    .M_AXI_AWPROT (M_AXI_AWPROT),
+    .M_AXI_AWVALID(M_AXI_AWVALID),
+    .M_AXI_AWREADY(M_AXI_AWREADY),
+
+    .M_AXI_WDATA  (M_AXI_WDATA),
+    .M_AXI_WSTRB  (M_AXI_WSTRB),
+    .M_AXI_WVALID (M_AXI_WVALID),
+    .M_AXI_WREADY (M_AXI_WREADY),
+
+    .M_AXI_BRESP  (M_AXI_BRESP),
+    .M_AXI_BVALID (M_AXI_BVALID),
+    .M_AXI_BREADY (M_AXI_BREADY),
+
+    .M_AXI_ARADDR (M_AXI_ARADDR),
+    .M_AXI_ARPROT (M_AXI_ARPROT),
+    .M_AXI_ARVALID(M_AXI_ARVALID),
+    .M_AXI_ARREADY(M_AXI_ARREADY),
+
+    .M_AXI_RDATA  (M_AXI_RDATA),
+    .M_AXI_RRESP  (M_AXI_RRESP),
+    .M_AXI_RVALID (M_AXI_RVALID),
+    .M_AXI_RREADY (M_AXI_RREADY)
+  );
+
+  // ---------------- Two AXI-Lite slaves ----------------
+  axil_mem_slave_sv #(.AW(AW), .DW(DW), .MEM_BYTES(64*1024), .RESP_LATENCY(2)) s0 (
+    .ACLK(clk), .ARESETN(rstn),
+    .S_AWVALID(M_AXI_AWVALID[0]),
+    .S_AWREADY(M_AXI_AWREADY[0]),
+    .S_AWADDR (M_AXI_AWADDR[0*AW +: AW]),
+    .S_AWPROT (M_AXI_AWPROT[0*3  +: 3]),
+    .S_WVALID (M_AXI_WVALID[0]),
+    .S_WREADY (M_AXI_WREADY[0]),
+    .S_WDATA  (M_AXI_WDATA[0*DW +: DW]),
+    .S_WSTRB  (M_AXI_WSTRB[0*(DW/8) +: (DW/8)]),
+    .S_BVALID (M_AXI_BVALID[0]),
+    .S_BREADY (M_AXI_BREADY[0]),
+    .S_BRESP  (M_AXI_BRESP[0*2 +: 2]),
+    .S_ARVALID(M_AXI_ARVALID[0]),
+    .S_ARREADY(M_AXI_ARREADY[0]),
+    .S_ARADDR (M_AXI_ARADDR[0*AW +: AW]),
+    .S_ARPROT (M_AXI_ARPROT[0*3  +: 3]),
+    .S_RVALID (M_AXI_RVALID[0]),
+    .S_RREADY (M_AXI_RREADY[0]),
+    .S_RDATA  (M_AXI_RDATA[0*DW +: DW]),
+    .S_RRESP  (M_AXI_RRESP[0*2 +: 2])
+  );
+
+  axil_mem_slave_sv #(.AW(AW), .DW(DW), .MEM_BYTES(64*1024), .RESP_LATENCY(3)) s1 (
+    .ACLK(clk), .ARESETN(rstn),
+    .S_AWVALID(M_AXI_AWVALID[1]),
+    .S_AWREADY(M_AXI_AWREADY[1]),
+    .S_AWADDR (M_AXI_AWADDR[1*AW +: AW]),
+    .S_AWPROT (M_AXI_AWPROT[1*3  +: 3]),
+    .S_WVALID (M_AXI_WVALID[1]),
+    .S_WREADY (M_AXI_WREADY[1]),
+    .S_WDATA  (M_AXI_WDATA[1*DW +: DW]),
+    .S_WSTRB  (M_AXI_WSTRB[1*(DW/8) +: (DW/8)]),
+    .S_BVALID (M_AXI_BVALID[1]),
+    .S_BREADY (M_AXI_BREADY[1]),
+    .S_BRESP  (M_AXI_BRESP[1*2 +: 2]),
+    .S_ARVALID(M_AXI_ARVALID[1]),
+    .S_ARREADY(M_AXI_ARREADY[1]),
+    .S_ARADDR (M_AXI_ARADDR[1*AW +: AW]),
+    .S_ARPROT (M_AXI_ARPROT[1*3  +: 3]),
+    .S_RVALID (M_AXI_RVALID[1]),
+    .S_RREADY (M_AXI_RREADY[1]),
+    .S_RDATA  (M_AXI_RDATA[1*DW +: DW]),
+    .S_RRESP  (M_AXI_RRESP[1*2 +: 2])
+  );
+
+  // ---------------- Clock/Reset ----------------
+  initial clk = 1'b0;
+  always #5 clk = ~clk; // 100MHz
+
+  initial begin
+    rstn = 1'b0;
+
+    // Initialize all master drives to known values (avoid X)
+    S_AXI_AWVALID = '0;
+    S_AXI_AWADDR  = '0;
+    S_AXI_AWPROT  = '0;
+    S_AXI_WVALID  = '0;
+    S_AXI_WDATA   = '0;
+    S_AXI_WSTRB   = '0;
+    S_AXI_BREADY  = '0;
+    S_AXI_ARVALID = '0;
+    S_AXI_ARADDR  = '0;
+    S_AXI_ARPROT  = '0;
+    S_AXI_RREADY  = '0;
+
+    // Waveform (Questa can show it, and VCD is optional)
+    $dumpfile("axilxbar_2x2.vcd");
+    $dumpvars(0, tb_axilxbar_2x2);
+
+    repeat (10) @(posedge clk);
+    rstn = 1'b1;
+  end
+
+  // ---------------- AXI-Lite master tasks (compliant & robust) ----------------
+
+  
+
+  // Cleanup/idle: prevents leftover valids/payloads from causing "ghost" transfers
+  task automatic master_idle(input int m);
+    begin
+      S_AXI_AWVALID[m] = 1'b0;
+      S_AXI_WVALID[m]  = 1'b0;
+      S_AXI_ARVALID[m] = 1'b0;
+      S_AXI_BREADY[m]  = 1'b0;
+      S_AXI_RREADY[m]  = 1'b0;
+
+      // Optional: clear payloads to keep waves clean and avoid confusion
+      S_AXI_AWADDR[m*AW +: AW] = '0;
+      S_AXI_WDATA[m*DW +: DW]  = '0;
+      S_AXI_WSTRB[m*(DW/8) +: (DW/8)] = '0;
+      S_AXI_ARADDR[m*AW +: AW] = '0;
+      S_AXI_AWPROT[m*3  +: 3 ] = '0;
+      S_AXI_ARPROT[m*3  +: 3 ] = '0;
+
+      // Give DUT 1 cycle to settle before next transaction
+      @(posedge clk);
+    end
+  endtask
+
+task automatic axil_write(
+  input int m,
+  input logic [AW-1:0] addr,
+  input logic [DW-1:0] data,
+  input logic [DW/8-1:0] strb
+);
+  int tmo;
+  begin
+    // --------------------
+    // Drive address
+    // --------------------
+    S_AXI_AWADDR[m*AW +: AW] = addr;
+    S_AXI_AWPROT[m*3  +: 3 ] = 3'b000;
+    S_AXI_AWVALID[m] = 1'b1;
+
+    // Let DUT sample AWVALID
+    @(posedge clk);
+
+    // Wait for AW handshake
+    tmo = 0;
+    while (!(S_AXI_AWVALID[m] && S_AXI_AWREADY[m])) begin
+      @(posedge clk);
+      if (!rstn) continue;
+      tmo++;
+      if (tmo > TIMEOUT_CYCLES) begin
+        $error("[%0t] TIMEOUT in axil_write: M%0d addr=%h (AW not accepted)",
+               $time, m, addr);
+        disable axil_write;
+      end
+    end
+
+   /////////// $display("[%0t] M%0d AW accepted addr=%h", $time, m, addr);
+    S_AXI_AWVALID[m] = 1'b0;
+
+    // --------------------
+    // Drive write data
+    // --------------------
+    S_AXI_WDATA[m*DW +: DW] = data;
+    S_AXI_WSTRB[m*(DW/8) +: (DW/8)] = strb;
+    S_AXI_WVALID[m] = 1'b1;
+
+    @(posedge clk);
+
+    // Wait for W handshake
+    tmo = 0;
+    while (!(S_AXI_WVALID[m] && S_AXI_WREADY[m])) begin
+      @(posedge clk);
+      if (!rstn) continue;
+      tmo++;
+      if (tmo > TIMEOUT_CYCLES) begin
+        $error("[%0t] TIMEOUT in axil_write: M%0d addr=%h (W not accepted)",
+               $time, m, addr);
+        disable axil_write;
+      end
+    end
+
+    ///////$display("[%0t] M%0d W accepted data=%h", $time, m, data);
+    S_AXI_WVALID[m] = 1'b0;
+
+    // --------------------
+    // Wait for response
+    // --------------------
+    S_AXI_BREADY[m] = 1'b1;
+
+    tmo = 0;
+    while (!S_AXI_BVALID[m]) begin
+      @(posedge clk);
+      if (!rstn) continue;
+      tmo++;
+      if (tmo > TIMEOUT_CYCLES) begin
+        $error("[%0t] TIMEOUT in axil_write: M%0d addr=%h (BVALID never asserted)",
+               $time, m, addr);
+        disable axil_write;
+      end
+    end
+
+    ///////$display("[%0t] M%0d WRITE addr=%h data=%h bresp=%b",$time, m, addr, data, S_AXI_BRESP[m*2 +: 2]);
+
+    // Complete B handshake
+    while (!(S_AXI_BVALID[m] && S_AXI_BREADY[m])) @(posedge clk);
+    S_AXI_BREADY[m] = 1'b0;
+
+    // --------------------
+    // Clean up master signals (important!)
+    // --------------------
+    master_idle(m);
+  end
+endtask
+
+
+task automatic axil_read(
+  input int m,
+  input logic [AW-1:0] addr,
+  output logic [DW-1:0] data_out,
+  output logic [1:0] resp_out
+);
+  int tmo;
+  begin
+    data_out = '0;
+    resp_out = '0;
+
+    // Drive AR and keep stable until handshake ON A CLOCK EDGE
+    S_AXI_ARADDR[m*AW +: AW] = addr;
+    S_AXI_ARPROT[m*3  +: 3 ] = 3'b000;
+    S_AXI_ARVALID[m] = 1'b1;
+    S_AXI_RREADY[m]  = 1'b1;   // OK to assert early
+
+    // IMPORTANT: wait at least one posedge so DUT can sample ARVALID
+    @(posedge clk);
+
+    // Wait for AR handshake on a posedge
+    tmo = 0;
+    while (!(S_AXI_ARVALID[m] && S_AXI_ARREADY[m])) begin
+      @(posedge clk);
+      if (!rstn) continue;
+      tmo++;
+      if (tmo > TIMEOUT_CYCLES) begin
+        $error("[%0t] TIMEOUT axil_read: M%0d addr=%h (AR not accepted) ARREADY=%b",
+               $time, m, addr, S_AXI_ARREADY[m]);
+        disable axil_read;
+      end
+    end
+
+    ///////$display("[%0t] M%0d AR accepted addr=%h", $time, m, addr);
+    S_AXI_ARVALID[m] = 1'b0;
+
+    // Wait for RVALID (posedge-based)
+    tmo = 0;
+    while (!S_AXI_RVALID[m]) begin
+      @(posedge clk);
+      if (!rstn) continue;
+      tmo++;
+      if (tmo > TIMEOUT_CYCLES) begin
+        $error("[%0t] TIMEOUT axil_read: M%0d addr=%h (RVALID never asserted)", $time, m, addr);
+        disable axil_read;
+      end
+    end
+
+    // Sample data/resp when RVALID is high
+    data_out = S_AXI_RDATA[m*DW +: DW];
+    resp_out = S_AXI_RRESP[m*2 +: 2];
+    ////////$display("[%0t] M%0d READ  addr=%h data=%h rresp=%b",$time, m, addr, data_out, resp_out);
+
+    // Complete handshake then drop RREADY
+    while (!(S_AXI_RVALID[m] && S_AXI_RREADY[m])) @(posedge clk);
+    S_AXI_RREADY[m] = 1'b0;
+  end
+endtask
+
+
+  // ---------------- Scenarios ----------------
+  logic [31:0] rd;
+  logic [1:0]  rresp;
+  logic [31:0] rd0, rd1;
+  logic [1:0]  rp0, rp1;
+  initial begin
+    wait (rstn);
+    repeat (5) @(posedge clk);
+
+    $display("---- SCENARIO 1: Parallel writes (M0->S0) and (M1->S1) ----");
+    fork
+      axil_write(0, 32'h0000_0010, 32'hAAAA_0001, 4'hF);
+      axil_write(1, 32'h0001_0020, 32'hBBBB_0001, 4'hF);
+    join
+    repeat (1) @(posedge clk);
+
+    $display("---- SCENARIO 2: Contention (both masters write S0) ----");
+    fork
+      axil_write(0, 32'h0000_0030, 32'hAAAA_0030, 4'hF);
+      axil_write(1, 32'h0000_0034, 32'hBBBB_0034, 4'hF);
+    join
+    repeat (1) @(posedge clk);
+
+    $display("---- SCENARIO 3: Read-after-write correctness ----");
+    axil_write(0, 32'h0001_0040, 32'h1234_5678, 4'hF);
+    axil_read (0, 32'h0001_0040, rd, rresp);
+    repeat (1) @(posedge clk);
+
+    $display("---- SCENARIO 4: Illegal address (expect DECERR from xbar) ----");
+    axil_write(1, 32'h0002_0000, 32'hDEAD_BEEF, 4'hF);
+    axil_read (1, 32'h0002_0000, rd, rresp);
+    repeat (1) @(posedge clk);
+
+    $display("---- SCENARIO 5: Parallel reads (M0->S0) and (M1->S1) ----");
+
+     // Preload both slaves
+     axil_write(0, 32'h0000_0100, 32'h1111_0100, 4'hF); // S0
+     axil_write(1, 32'h0001_0100, 32'h2222_0100, 4'hF); // S1
+
+     repeat (1) @(posedge clk);
+
+     fork
+     axil_read(0, 32'h0000_0100, rd0, rp0);
+     axil_read(1, 32'h0001_0100, rd1, rp1);
+     join
+
+    $display("S5 Results: M0 data=%h resp=%b | M1 data=%h resp=%b", rd0, rp0, rd1, rp1);
+
+    $display("---- SCENARIO 6: Read contention (M0->S0, M1->S0) ----");
+
+     // Preload S0
+     axil_write(0, 32'h0000_0200, 32'hAAAA_0200, 4'hF);
+     axil_write(0, 32'h0000_0204, 32'hBBBB_0204, 4'hF);
+
+     repeat (1) @(posedge clk);
+
+     fork
+       axil_read(0, 32'h0000_0200, rd0, rp0);
+       axil_read(1, 32'h0000_0204, rd1, rp1);
+     join
+
+    $display("S6 Results: M0 data=%h resp=%b | M1 data=%h resp=%b", rd0, rp0, rd1, rp1);
+ 
+    $display("---- SCENARIO 7: Mixed RW contention on S0 (M0 write, M1 read) ----");
+
+    // Preload read location
+    axil_write(0, 32'h0000_0300, 32'h1234_0300, 4'hF);
+    repeat (1) @(posedge clk);
+
+   fork
+     axil_write(0, 32'h0000_0310, 32'hDEAD_0310, 4'hF);  // M0 write S0
+     axil_read (1, 32'h0000_0300, rd1, rp1);             // M1 read S0
+   join
+
+   $display("S7 Results: M1 read data=%h resp=%b", rd1, rp1);
+
+    $display("---- DONE ----");
+    repeat (10) @(posedge clk);
+    $finish;
+  end
+
+
+always_ff @(posedge clk) begin
+  if (rstn) begin
+    // -------- Master-side handshakes --------
+    if (m0_awvalid && m0_awready)
+      $display("[%0t] M0 -> AW addr=%h", $time, m0_awaddr);
+    if (m0_wvalid && m0_wready)
+      $display("[%0t] M0 -> W  data=%h", $time, m0_wdata);
+    if (m0_bvalid && m0_bready)
+      $display("[%0t] M0 <- B  resp=%b", $time, m0_bresp);
+    if (m0_arvalid && m0_arready)
+      $display("[%0t] M0 -> AR addr=%h", $time, m0_araddr);
+    if (m0_rvalid && m0_rready)
+      $display("[%0t] M0 <- R  data=%h resp=%b", $time, m0_rdata, m0_rresp);
+
+    if (m1_awvalid && m1_awready)
+      $display("[%0t] M1 -> AW addr=%h", $time, m1_awaddr);
+    if (m1_wvalid && m1_wready)
+      $display("[%0t] M1 -> W  data=%h", $time, m1_wdata);
+    if (m1_bvalid && m1_bready)
+      $display("[%0t] M1 <- B  resp=%b", $time, m1_bresp);
+    if (m1_arvalid && m1_arready)
+      $display("[%0t] M1 -> AR addr=%h", $time, m1_araddr);
+    if (m1_rvalid && m1_rready)
+      $display("[%0t] M1 <- R  data=%h resp=%b", $time, m1_rdata, m1_rresp);
+
+    // -------- Slave-side handshakes --------
+    if (s0_awvalid && s0_awready)
+      $display("[%0t] XBAR -> S0 AW addr=%h", $time, s0_awaddr);
+    if (s0_wvalid && s0_wready)
+      $display("[%0t] XBAR -> S0 W  data=%h", $time, s0_wdata);
+    if (s0_bvalid && s0_bready)
+      $display("[%0t] XBAR <- S0 B  resp=%b", $time, s0_bresp);
+    if (s0_arvalid && s0_arready)
+      $display("[%0t] XBAR -> S0 AR addr=%h", $time, s0_araddr);
+    if (s0_rvalid && s0_rready)
+      $display("[%0t] XBAR <- S0 R  data=%h", $time, s0_rdata);
+
+    if (s1_awvalid && s1_awready)
+      $display("[%0t] XBAR -> S1 AW addr=%h", $time, s1_awaddr);
+    if (s1_wvalid && s1_wready)
+      $display("[%0t] XBAR -> S1 W  data=%h", $time, s1_wdata);
+    if (s1_bvalid && s1_bready)
+      $display("[%0t] XBAR <- S1 B  resp=%b", $time, s1_bresp);
+    if (s1_arvalid && s1_arready)
+      $display("[%0t] XBAR -> S1 AR addr=%h", $time, s1_araddr);
+    if (s1_rvalid && s1_rready)
+      $display("[%0t] XBAR <- S1 R  data=%h", $time, s1_rdata);
+  end
+end
+
+
+endmodule
+
+
+
+
+
+
+
